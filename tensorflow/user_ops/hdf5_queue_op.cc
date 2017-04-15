@@ -40,75 +40,23 @@
 #include <hdf5.h>
 #include <assert.h>
 
-#ifndef STREAM_FILE
-#define STREAM_FILE "/data/data.hdf5"
-#endif
-
 namespace tensorflow {
 
-  class Stream: public FIFOQueue {
+  class HDF5Queue: public FIFOQueue {
   public:
-    Stream(int capacity, const string &stream_id_,
-	   const std::vector<string> &substream_names,
-	   const DataTypeVector& component_dtypes,
-	   const std::vector<TensorShape>& component_shapes,
-	   const string& name) :
+    HDF5Queue(string filename_,
+	      const std::vector<string> &datasets_,
+	      bool overwrite, int capacity, 
+	      const DataTypeVector& component_dtypes,
+	      const std::vector<TensorShape>& component_shapes,
+	      const string& name) :
       FIFOQueue(capacity, component_dtypes, component_shapes, name),
-      back_queue(new FIFOQueue(capacity, component_dtypes, component_shapes, name)) {
-      // Open stream
-      file = H5Fopen(STREAM_FILE, H5F_ACC_RDWR, H5P_DEFAULT);
-      
-      // Check if stream exists
-      status = H5Eset_auto2(0, NULL, NULL);
-      status = H5Gget_objinfo(file, stream_id_.c_str(), 0, NULL);
-      if (status == 0) { // Stream group exists
-	stream = H5Gopen(file, stream_id_.c_str(), H5P_DEFAULT);
-      } else {
-	stream = H5Gcreate(file, stream_id_.c_str(), H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-      }
-
-      // Create HDF5 subgroups
-      for (int i=0;i<num_components();i++) {
-	if (H5Lexists(stream, substream_names[i].c_str(), H5P_DEFAULT) > 0) {
-	  substreams.push_back(H5Dopen2(stream, substream_names[i].c_str(), H5P_DEFAULT));
-	} else {
-	  const TensorShape &s = component_shapes[i];
-	  std::vector<hsize_t> dims(s.dims());
-	  for (int i=0;i<s.dims();i++)
-	    dims[i] = s.dim_size(i);
-	  dims.insert(dims.begin(), 1);
-	  std::vector<hsize_t> maxdims(dims), chunkdims(dims);
-	  maxdims[0] = H5S_UNLIMITED;
-	  chunkdims[0] = 5; // Design choice
-
-	  hid_t prop = H5Pcreate(H5P_DATASET_CREATE);
-	  H5Pset_chunk(prop, s.dims()+1, chunkdims.data());
-	  hid_t dspace = H5Screate_simple(s.dims()+1, dims.data(), maxdims.data());
-	  substreams.push_back(H5Dcreate2(stream, substream_names[i].c_str(), 
-					  get_type(component_dtypes[i]), dspace,
-					  H5P_DEFAULT, prop, H5P_DEFAULT));
-	}
-      }
-      
-      current_row=0;
-    }
-    
-    Status Initialize() override {
-      Status s0, s1;
-      s0 = FIFOQueue::Initialize();
-      s1 = back_queue->Initialize();
-
-      if (!s0.ok())
-	return s0;      
-      if (!s1.ok())
-	return s1;
-
-      return Status::OK();
-    }
+      back_queue(new FIFOQueue(capacity, component_dtypes, component_shapes, name)),
+      filename(filename_), datasets(datasets_), overwrite(overwrite) {    }
 
     Status MatchesNodeDef(const NodeDef& node_def) override {
-      if (!MatchesNodeDefOp(node_def, "Stream").ok()) {
-	return errors::InvalidArgument("Expected Stream, found ", node_def.op());
+      if (!MatchesNodeDefOp(node_def, "HDF5Queue").ok()) {
+	return errors::InvalidArgument("Expected HDF5Queue, found ", node_def.op());
       }
       TF_RETURN_IF_ERROR(MatchesNodeDefCapacity(node_def, capacity_));
       TF_RETURN_IF_ERROR(MatchesNodeDefTypes(node_def));
@@ -163,6 +111,80 @@ namespace tensorflow {
 				});
       t.join();      
     }
+    
+    Status Initialize() override {
+      Status s0, s1;
+      s0 = FIFOQueue::Initialize();
+      s1 = back_queue->Initialize();
+
+      if (!s0.ok())
+	return s0;      
+      if (!s1.ok())
+	return s1;
+
+      if (Env::Default()->FileExists(filename).ok()) {
+	// Open file
+	file = H5Fopen(filename.c_str(), 
+		       (overwrite ? H5F_ACC_TRUNC : H5F_ACC_RDWR), 
+		       H5P_DEFAULT);
+      } else {
+	file = H5Fcreate(filename.c_str(), H5F_ACC_TRUNC, 
+			 H5P_DEFAULT, H5P_DEFAULT);
+      }
+      assert(file >= 0); // File opened properly
+      
+      // Create HDF5 subgroups
+      for (int i=0;i<num_components();i++) {
+	// Check if path exists
+	size_t pos = datasets[i].rfind("/");
+	if (pos != string::npos) {
+	  string path = datasets[i].substr(0, pos);
+	  status = H5Eset_auto2(0, NULL, NULL);
+	  status = H5Gget_objinfo(file, path.c_str(), 0, NULL);
+	  if (status != 0) { // Path doesn't exist, create it
+	    hid_t lcpl = H5Pcreate(H5P_LINK_CREATE);
+	    H5Pset_create_intermediate_group(lcpl, 1);
+	    assert(H5Gcreate(file, path.c_str(), lcpl, H5P_DEFAULT, H5P_DEFAULT) > 0);
+	  }
+	}
+
+	hid_t dset_id;
+	if (H5Lexists(file, datasets[i].c_str(), H5P_DEFAULT) > 0) {
+	  dset_id = H5Dopen2(file, datasets[i].c_str(), H5P_DEFAULT);
+	  hid_t dspace = H5Dget_space(dset_id);
+	  assert(H5Sget_simple_extent_ndims(dspace) == component_shapes_[i].dims()+1);
+	  // TODO: Check HDF5 dims against shape
+	  
+	  dataset_ids.push_back(dset_id);
+	} else {
+	  const TensorShape &s = component_shapes_[i];
+	  std::vector<hsize_t> dims(s.dims());
+	  for (int i=0;i<s.dims();i++)
+	    dims[i] = s.dim_size(i);
+	  dims.insert(dims.begin(), 1);
+	  std::vector<hsize_t> maxdims(dims), chunkdims(dims);
+	  maxdims[0] = H5S_UNLIMITED;
+	  chunkdims[0] = 5; // Design choice
+
+	  hid_t prop = H5Pcreate(H5P_DATASET_CREATE);
+	  H5Pset_chunk(prop, s.dims()+1, chunkdims.data());
+	  assert(prop > 0);
+	  hid_t dspace = H5Screate_simple(s.dims()+1, dims.data(), maxdims.data());
+	  assert(dspace > 0);
+	  
+	  dset_id = H5Dcreate2(file, datasets[i].c_str(), 
+			       get_type(component_dtypes_[i]), dspace,
+			       H5P_DEFAULT, prop, H5P_DEFAULT);
+	}
+	assert(dset_id >= 0);
+	dataset_ids.push_back(dset_id);
+      }
+
+      // Set the cursor
+      current_row=0;
+
+      return Status::OK();
+    }
 
   private:
     void dequeuer(bool &done, OpKernelContext *ctx) {
@@ -171,11 +193,11 @@ namespace tensorflow {
 	back_queue->TryDequeue(ctx, 
 	   [this, ctx, &n](const QueueInterface::Tuple& tuple) {
 	       if (ctx->status().ok()) {
-		 for (int i=0;i<substreams.size();i++) {
+		 for (int i=0;i<dataset_ids.size();i++) {
 		   PersistentTensor pt = PersistentTensor(tuple[i]);
 		   Tensor &t = *pt.AccessTensor(ctx);
 		   // Resize for append
-		   hid_t dataspace = H5Dget_space(substreams[i]);
+		   hid_t dataspace = H5Dget_space(dataset_ids[i]);
 
 		   std::vector<hsize_t> offset(t.dims()+1, 0), stride(t.dims()+1, 1), 
 		     count(t.dims()), dims(t.dims()+1, 0);
@@ -184,19 +206,19 @@ namespace tensorflow {
 
 		   H5Sget_simple_extent_dims(dataspace, dims.data(), NULL);
 		   dims[0]++;
-		   H5Dset_extent(substreams[i], dims.data());
+		   H5Dset_extent(dataset_ids[i], dims.data());
 		   
 		   // Get Hyperslab
 		   offset[0] = dims[0];
 		   count.insert(count.begin(), 1); // 1 row
-		   dataspace = H5Dget_space(substreams[i]);
+		   dataspace = H5Dget_space(dataset_ids[i]);
 		   assert(H5Sget_simple_extent_ndims(dataspace) == dims.size());
 
 		   status = H5Sselect_hyperslab(dataspace, H5S_SELECT_SET, offset.data(),
 						stride.data(), count.data(), NULL);
 		   
 		   // Write to Hyperslab
-		   H5Dwrite(substreams[i], get_type(component_dtypes_[i]), 
+		   H5Dwrite(dataset_ids[i], get_type(component_dtypes_[i]), 
 			    H5S_ALL, H5S_ALL, H5P_DEFAULT, const_cast<void*>(DMAHelper::base(&t)));
 		 }
 	       }
@@ -214,13 +236,13 @@ namespace tensorflow {
 	Tuple tuple;
 	tuple.reserve(num_components());
 
-	assert(num_components() == substreams.size());
+	assert(num_components() == dataset_ids.size());
 	// Pull from HDF5
-	for (int i=0;i<substreams.size();i++) {
+	for (int i=0;i<dataset_ids.size();i++) {
 	  Tensor t;
 	  TensorShape s = component_shapes_[i];
 	  ctx->allocate_temp(component_dtypes_[i], s, &t);
-	  hid_t dataspace = H5Dget_space(substreams[i]);
+	  hid_t dataspace = H5Dget_space(dataset_ids[i]);
 	  std::vector<hsize_t> offset(t.dims()+1, 0), stride(t.dims()+1, 1), 
 	    count(t.shape().dim_sizes().data(), 
 		  t.shape().dim_sizes().data() + t.dims()), dims(t.dims()+1, 0);
@@ -229,7 +251,7 @@ namespace tensorflow {
 	  
 	  status = H5Sselect_hyperslab(dataspace, H5S_SELECT_SET, offset.data(),
 				       stride.data(), count.data(), NULL);
-	  H5Dread(substreams[i], get_type(component_dtypes_[i]), 
+	  H5Dread(dataset_ids[i], get_type(component_dtypes_[i]), 
 		  H5S_ALL, H5S_ALL, H5P_DEFAULT, const_cast<void*>(DMAHelper::base(&t)));
 	  tuple.emplace_back(t);
 	}
@@ -260,11 +282,14 @@ namespace tensorflow {
       return H5T_IEEE_F32LE;
     }
 
-    hid_t file, stream, gcpl;
+    std::vector<string> datasets;
+    string filename;
+    bool overwrite;
+
+    hid_t file, gcpl;
     hsize_t current_row;
     herr_t status;
-    string stream_id_;
-    std::vector<hid_t> substreams;
+    std::vector<hid_t> dataset_ids;
 
     FIFOQueue *back_queue;
   };
@@ -273,16 +298,17 @@ namespace tensorflow {
   // backed by Stream) that persists across different graph
   // executions, and sessions. Running this op produces a single-element
   // tensor of handles to Queues in the corresponding device.
-  class StreamOp : public ResourceOpKernel<QueueInterface> {
+  class HDF5QueueOp : public ResourceOpKernel<QueueInterface> {
   public:
-    explicit StreamOp(OpKernelConstruction* context) : 
+    explicit HDF5QueueOp(OpKernelConstruction* context) : 
       ResourceOpKernel(context) {
       OP_REQUIRES_OK(context, context->GetAttr("capacity", &capacity_));
       if (capacity_ < 0) {
 	capacity_ = QueueBase::kUnbounded;
       }
-      context->GetAttr("stream_id", &stream_id_);
-      context->GetAttr("stream_columns", &stream_columns_);
+      context->GetAttr("filename", &filename);
+      context->GetAttr("datasets", &datasets);
+      context->GetAttr("overwrite", &overwrite);
       context->GetAttr("component_types", &component_types_);
       context->GetAttr("shapes", &component_shapes_);
     }
@@ -290,8 +316,9 @@ namespace tensorflow {
   private:
     Status CreateResource(QueueInterface** ret) override
       EXCLUSIVE_LOCKS_REQUIRED(mu_) {
-      Stream* queue = new Stream(capacity_, stream_id_, stream_columns_, component_types_,
-				 component_shapes_, cinfo_.name());
+      HDF5Queue* queue = new HDF5Queue(filename, datasets, overwrite,
+				       capacity_, component_types_,
+				       component_shapes_, cinfo_.name());
       
       *ret = queue;
       return queue->Initialize();
@@ -301,16 +328,17 @@ namespace tensorflow {
       return queue->MatchesNodeDef(def());
     }
 
-    string stream_id_;
+    string filename;
+    bool overwrite;
     std::vector<TensorShape> component_shapes_;
-    std::vector<string> stream_columns_;
+    std::vector<string> datasets;
     int32 capacity_;
     DataTypeVector component_types_;
 
-    TF_DISALLOW_COPY_AND_ASSIGN(StreamOp);
+    TF_DISALLOW_COPY_AND_ASSIGN(HDF5QueueOp);
   };
 
-  REGISTER_KERNEL_BUILDER(Name("Stream").Device(DEVICE_CPU), StreamOp);
+  REGISTER_KERNEL_BUILDER(Name("HDF5Queue").Device(DEVICE_CPU), HDF5QueueOp);
 
   using shape_inference::DimensionHandle;
   using shape_inference::InferenceContext;
@@ -323,10 +351,11 @@ namespace tensorflow {
     }
   }  // namespace
 
-  REGISTER_OP("Stream")
+  REGISTER_OP("HDF5Queue")
   .Output("handle: resource")
-  .Attr("stream_id: string")
-  .Attr("stream_columns: list(string)")
+  .Attr("filename: string")
+  .Attr("datasets: list(string)")
+  .Attr("overwrite: bool = false")
   .Attr("component_types: list(type) >= 0 = []")
   .Attr("shapes: list(shape) >= 0 = []")
   .Attr("shared_name: string = ''")
