@@ -19,6 +19,7 @@
 #include <vector>
 #include <thread>
 #include <iostream>
+#include <chrono>
 
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/node_def_util.h"
@@ -95,27 +96,17 @@ namespace tensorflow {
     }
 
     void TryDequeue(OpKernelContext* ctx, CallbackWithTuple callback) override {
-      bool done=false;
-      std::thread t ([this, &done, &ctx] () {enqueuer(done, ctx);});
-      FIFOQueue::TryDequeue(ctx, 
-			    [callback, &done](const QueueInterface::Tuple& tuple) {
-			      done=true;
-			      callback(tuple);
-			    });
+      std::thread t ([this, &ctx] () {enqueuer(1, ctx);});
+      FIFOQueue::TryDequeue(ctx, callback);
       t.join();
     }
 
     void TryDequeueMany(int num_elements, OpKernelContext* ctx,
 			bool allow_small_batch,
 			CallbackWithTuple callback) override {
-      bool done=false;
-      std::thread t ([this, &done, &ctx] () {enqueuer(done, ctx);});
-      FIFOQueue::TryDequeueMany(num_elements, ctx, allow_small_batch,
-				[callback, &done](const QueueInterface::Tuple& tuple) {
-				  done=true;
-				  callback(tuple);
-				});
-      t.join();      
+      std::thread t ([this, num_elements, &ctx] () {enqueuer(num_elements, ctx);});
+      FIFOQueue::TryDequeueMany(num_elements, ctx, allow_small_batch, callback);
+      t.join();
     }
     
     Status Initialize() override {
@@ -188,7 +179,7 @@ namespace tensorflow {
       }
 
       // Set the cursor
-      current_row=0;
+      write_row = read_row = 0;
 
       return Status::OK();
     }
@@ -207,7 +198,8 @@ namespace tensorflow {
       count.insert(count.begin(), 1); // 1 row
 
       dspace = H5Dget_space(dset);
-      herr_t status = H5Sselect_hyperslab(dspace, H5S_SELECT_SET, offset.data(), NULL, count.data(), NULL);
+      herr_t status = H5Sselect_hyperslab(dspace, H5S_SELECT_SET, offset.data(), 
+					  NULL, count.data(), NULL);
       assert(status == 0);
       assert(shp.num_elements() == H5Sget_select_npoints(dspace));
       assert(shp.num_elements() == H5Sget_select_npoints(mspace));
@@ -222,17 +214,20 @@ namespace tensorflow {
 		 for (int i=0;i<dataset_ids.size();i++) {
 		   const Tensor &t(tuple[i]);
 		   hid_t dataspace, memspace;
-		   
-		   std::vector<hsize_t> dims(t.dims()+1);
-		   H5Sget_simple_extent_dims(H5Dget_space(dataset_ids[i]), dims.data(), NULL);
-		   prep_H5space(dataset_ids[i], t.shape(), dataspace, memspace, dims[0]-1);
+
+		   prep_H5space(dataset_ids[i], t.shape(), dataspace, memspace, write_row);
 		   // Write to Hyperslab
+		   std::cerr << "Writing " << write_row << std::endl;
 		   H5Dwrite(dataset_ids[i], get_type(component_dtypes_[i]), 
 			    memspace, dataspace, H5P_DEFAULT, 
 			    const_cast<void*>(DMAHelper::base(&t)));
+
+		   std::vector<hsize_t> dims(t.dims()+1);
+		   H5Sget_simple_extent_dims(H5Dget_space(dataset_ids[i]), dims.data(), NULL);
 		   dims[0]++;
 		   H5Dset_extent(dataset_ids[i], dims.data());
 		 }
+		 write_row++;
 	       }
 	       n.Notify();
 	   }
@@ -241,13 +236,18 @@ namespace tensorflow {
       }
     }
 
-    void enqueuer(bool &done, OpKernelContext *ctx) {
+    void enqueuer(int rounds, OpKernelContext *ctx) {
       Notification n;
 
-      while (!done) {
+      for (int rnd=0;rnd<rounds;rnd++) {
+	while (read_row > write_row) {
+	  std::cerr << "R>W " << read_row << " " << write_row << " " << rnd << std::endl;
+	  std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(500.0));
+	}
+
 	Tuple tuple;
 	tuple.reserve(num_components());
-	
+
 	assert(num_components() == dataset_ids.size());
 	// Pull from HDF5
 	for (int i=0;i<dataset_ids.size();i++) {
@@ -256,17 +256,18 @@ namespace tensorflow {
 	  ctx->allocate_temp(component_dtypes_[i], s, &t);
 	  
 	  hid_t dataspace, memspace;
-	  prep_H5space(dataset_ids[i], t.shape(), dataspace, memspace, current_row);
+	  prep_H5space(dataset_ids[i], t.shape(), dataspace, memspace, read_row);
+	  std::cerr << "Reading " << read_row << std::endl;
 	  H5Dread(dataset_ids[i], get_type(component_dtypes_[i]), 
 	  	  memspace, dataspace, H5P_DEFAULT,
-		  const_cast<void*>(DMAHelper::base(&t)));
+		  const_cast<void*>(DMAHelper::base(&t)));	  
 	  
-
 	  tuple.emplace_back(t);
 	}
 	
+	std::cerr << read_row << " vs. " << write_row << std::endl;
 	FIFOQueue::TryEnqueue(tuple, ctx, [&n]() {n.Notify();});
-	current_row++;
+	read_row++;
 	n.WaitForNotification();
       }
     }
@@ -297,7 +298,7 @@ namespace tensorflow {
     bool overwrite;
 
     hid_t file, gcpl;
-    hsize_t current_row;
+    hsize_t read_row, write_row;
     herr_t status;
     std::vector<hid_t> dataset_ids;
 

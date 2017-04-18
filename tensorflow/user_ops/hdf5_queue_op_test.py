@@ -40,7 +40,7 @@ class HDF5Queue(QueueBase):
 
 
 
-class DuplicateOpTest(tf.test.TestCase):
+class HDF5QueueOpTest(tf.test.TestCase):
   def testBasic(self):
     shapes = [[1], [2, 3], [1, 1]]
     dtypes = [numpy.int32, numpy.float32, numpy.float32]
@@ -48,28 +48,26 @@ class DuplicateOpTest(tf.test.TestCase):
                       ['a', 'b/c', 'd/e/f'],
                       dtypes, shapes)
 
+    # Try to simulate a reasonable use case
+    # by enqueuing a bunch of random data and then doing
+    # randomly timed dequeues
+    # and a large batch of dequeues at the end
     with self.test_session() as sess:
-      sess.run(queue.enqueue([numpy.zeros(s) for s in shapes]))
-      sess.run(queue.enqueue([numpy.ones(s) for s in shapes]))
-      sess.run(queue.enqueue([numpy.ones(s) for s in shapes]))
-      sess.run(queue.enqueue([numpy.zeros(s) for s in shapes]))
-      
-      for a, b in zip(sess.run(queue.dequeue()), 
-                      [numpy.zeros(s, dtype=d) 
-                       for s, d in zip(shapes, dtypes)]):
-        self.assertTrue(numpy.all(a == b))
-      for a, b in zip(sess.run(queue.dequeue()), 
-                      [numpy.ones(s, dtype=d) 
-                       for s, d in zip(shapes, dtypes)]):
-        self.assertTrue(numpy.all(a == b))
-      for a, b in zip(sess.run(queue.dequeue()), 
-                      [numpy.ones(s, dtype=d) 
-                       for s, d in zip(shapes, dtypes)]):
-        self.assertTrue(numpy.all(a == b))
-      for a, b in zip(sess.run(queue.dequeue()), 
-                      [numpy.zeros(s, dtype=d) 
-                       for s, d in zip(shapes, dtypes)]):
-        self.assertTrue(numpy.all(a == b))
+      data = []
+      for i in range(50):
+        data.append([numpy.random.randn(*s).astype(d)
+                     for s, d in zip(shapes, dtypes)])
+        sess.run(queue.enqueue(data[-1]))
+        
+        if True or numpy.random.rand() > 0.5:
+          for a, b in zip(sess.run(queue.dequeue()), data.pop(0)):
+            print(a, b)
+            self.assertTrue(numpy.all(a == b))
+
+      for i, d in enumerate(data):
+        for a, b in zip(sess.run(queue.dequeue()), d):
+          print(a, b)
+          self.assertTrue(numpy.all(a == b))
 
 if __name__ == '__main__':
   tf.test.main()
