@@ -41,7 +41,6 @@ class HDF5Queue(QueueBase):
 
 
 class DuplicateOpTest(tf.test.TestCase):
-
   def testBasic(self):
     shapes = [[1], [2, 3], [1, 1]]
     dtypes = [numpy.int32, numpy.float32, numpy.float32]
@@ -58,19 +57,19 @@ class DuplicateOpTest(tf.test.TestCase):
       for a, b in zip(sess.run(queue.dequeue()), 
                       [numpy.zeros(s, dtype=d) 
                        for s, d in zip(shapes, dtypes)]):
-        self.assertEqual(a, b)
+        self.assertTrue(numpy.all(a == b))
       for a, b in zip(sess.run(queue.dequeue()), 
                       [numpy.ones(s, dtype=d) 
                        for s, d in zip(shapes, dtypes)]):
-        self.assertEqual(a, b)
+        self.assertTrue(numpy.all(a == b))
       for a, b in zip(sess.run(queue.dequeue()), 
                       [numpy.ones(s, dtype=d) 
                        for s, d in zip(shapes, dtypes)]):
-        self.assertEqual(a, b)
+        self.assertTrue(numpy.all(a == b))
       for a, b in zip(sess.run(queue.dequeue()), 
                       [numpy.zeros(s, dtype=d) 
                        for s, d in zip(shapes, dtypes)]):
-        self.assertEqual(a, b)
+        self.assertTrue(numpy.all(a == b))
 
 if __name__ == '__main__':
   tf.test.main()

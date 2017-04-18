@@ -178,7 +178,7 @@ namespace tensorflow {
 	  hid_t dspace = H5Screate_simple(s.dims()+1, dims.data(), maxdims.data());
 	  assert(dspace > 0);
 	  assert(H5Sget_simple_extent_ndims(dspace) == dims.size());
-	  
+
 	  dset_id = H5Dcreate2(file, datasets[i].c_str(), 
 			       get_type(component_dtypes_[i]), dspace,
 			       H5P_DEFAULT, prop, H5P_DEFAULT);
@@ -194,6 +194,25 @@ namespace tensorflow {
     }
 
   private:
+    void prep_H5space(const hid_t &dset, const TensorShape &shp,
+		      hid_t &dspace, hid_t &mspace, int row_number) {
+      dspace = H5Dget_space(dset);
+      
+      std::vector<hsize_t> offset(shp.dims()+1, 0), count(shp.dims());
+
+      offset[0] = row_number;
+      for (int j=0;j<shp.dims();j++)
+	count[j] = shp.dim_size(j);
+      mspace = H5Screate_simple(shp.dims(), count.data(), NULL);
+      count.insert(count.begin(), 1); // 1 row
+
+      dspace = H5Dget_space(dset);
+      herr_t status = H5Sselect_hyperslab(dspace, H5S_SELECT_SET, offset.data(), NULL, count.data(), NULL);
+      assert(status == 0);
+      assert(shp.num_elements() == H5Sget_select_npoints(dspace));
+      assert(shp.num_elements() == H5Sget_select_npoints(mspace));
+    }
+
     void dequeuer(bool &done, OpKernelContext *ctx) {
       Notification n;
       while (!done) {
@@ -202,30 +221,17 @@ namespace tensorflow {
 	       if (ctx->status().ok()) {
 		 for (int i=0;i<dataset_ids.size();i++) {
 		   const Tensor &t(tuple[i]);
-		   // Resize for append
-		   hid_t dataspace = H5Dget_space(dataset_ids[i]);
-
-		   std::vector<hsize_t> offset(t.dims()+1, 0), stride(t.dims()+1, 1), 
-		     count(t.dims()), dims(t.dims()+1, 0);
-		   for (int j=0;j<t.dims();j++)
-		     count[j] = t.shape().dim_size(j);
-
-		   H5Sget_simple_extent_dims(dataspace, dims.data(), NULL);
+		   hid_t dataspace, memspace;
+		   
+		   std::vector<hsize_t> dims(t.dims()+1);
+		   H5Sget_simple_extent_dims(H5Dget_space(dataset_ids[i]), dims.data(), NULL);
 		   dims[0]++;
 		   H5Dset_extent(dataset_ids[i], dims.data());
-		   
-		   // Get Hyperslab
-		   offset[0] = dims[0];
-		   count.insert(count.begin(), 1); // 1 row
-		   dataspace = H5Dget_space(dataset_ids[i]);
-		   assert(H5Sget_simple_extent_ndims(dataspace) == dims.size());
 
-		   status = H5Sselect_hyperslab(dataspace, H5S_SELECT_SET, offset.data(),
-						stride.data(), count.data(), NULL);
-		   
+		   prep_H5space(dataset_ids[i], t.shape(), dataspace, memspace, dims[0]-1);
 		   // Write to Hyperslab
 		   H5Dwrite(dataset_ids[i], get_type(component_dtypes_[i]), 
-			    H5S_ALL, H5S_ALL, H5P_DEFAULT, const_cast<void*>(DMAHelper::base(&t)));
+			    memspace, dataspace, H5P_DEFAULT, const_cast<void*>(DMAHelper::base(&t)));
 		 }
 	       }
 	       n.Notify();
@@ -247,30 +253,10 @@ namespace tensorflow {
 	for (int i=0;i<dataset_ids.size();i++) {
 	  Tensor t;
 	  TensorShape s = component_shapes_[i];
-
 	  ctx->allocate_temp(component_dtypes_[i], s, &t);
-	  hid_t dataspace = H5Dget_space(dataset_ids[i]);
-	  std::vector<hsize_t> offset(t.dims()+1, 0), stride(t.dims()+1, 1), 
-	    count(t.dims()), dims(t.dims()+1, 0);
-	  offset[0] = current_row;
-
-	  for (int j=0;j<t.dims();j++)
-	    count[j] = t.shape().dim_size(j);
-	  hid_t memspace = H5Screate_simple(t.dims(), count.data(), NULL);
-
-	  count.insert(count.begin(), 1); // 1 row
-	  status = H5Sselect_hyperslab(dataspace, H5S_SELECT_SET, offset.data(),
-				       stride.data(), count.data(), NULL);
-
-	  std::cerr << "CNT: ";
-	  for (hsize_t x : count)
-	    std::cerr << x << " ";
-	  std::cerr << std::endl;
-
-	  std::cerr << t.NumElements() << " vs. " << H5Sget_simple_extent_npoints(dataspace) << std::endl;
-	  std::cerr << t.NumElements() << " vs. " << H5Sget_simple_extent_npoints(memspace) << std::endl;
-	  assert(t.NumElements() == H5Sget_simple_extent_npoints(dataspace));
-	  assert(t.NumElements() == H5Sget_simple_extent_npoints(memspace));
+	  
+	  hid_t dataspace, memspace;
+	  prep_H5space(dataset_ids[i], t.shape(), dataspace, memspace, current_row);
 	  H5Dread(dataset_ids[i], get_type(component_dtypes_[i]), 
 	  	  memspace, dataspace, H5P_DEFAULT, const_cast<void*>(DMAHelper::base(&t)));
 
@@ -279,7 +265,7 @@ namespace tensorflow {
 	
 	FIFOQueue::TryEnqueue(tuple, ctx, [&n]() {n.Notify();});
 	current_row++;
-	n.WaitForNotification();
+	n.WaitForNotification();     
       }
     }
     
