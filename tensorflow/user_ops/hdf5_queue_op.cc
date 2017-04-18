@@ -225,13 +225,13 @@ namespace tensorflow {
 		   
 		   std::vector<hsize_t> dims(t.dims()+1);
 		   H5Sget_simple_extent_dims(H5Dget_space(dataset_ids[i]), dims.data(), NULL);
-		   dims[0]++;
-		   H5Dset_extent(dataset_ids[i], dims.data());
-
 		   prep_H5space(dataset_ids[i], t.shape(), dataspace, memspace, dims[0]-1);
 		   // Write to Hyperslab
 		   H5Dwrite(dataset_ids[i], get_type(component_dtypes_[i]), 
-			    memspace, dataspace, H5P_DEFAULT, const_cast<void*>(DMAHelper::base(&t)));
+			    memspace, dataspace, H5P_DEFAULT, 
+			    const_cast<void*>(DMAHelper::base(&t)));
+		   dims[0]++;
+		   H5Dset_extent(dataset_ids[i], dims.data());
 		 }
 	       }
 	       n.Notify();
@@ -258,14 +258,16 @@ namespace tensorflow {
 	  hid_t dataspace, memspace;
 	  prep_H5space(dataset_ids[i], t.shape(), dataspace, memspace, current_row);
 	  H5Dread(dataset_ids[i], get_type(component_dtypes_[i]), 
-	  	  memspace, dataspace, H5P_DEFAULT, const_cast<void*>(DMAHelper::base(&t)));
+	  	  memspace, dataspace, H5P_DEFAULT,
+		  const_cast<void*>(DMAHelper::base(&t)));
+	  
 
 	  tuple.emplace_back(t);
 	}
 	
 	FIFOQueue::TryEnqueue(tuple, ctx, [&n]() {n.Notify();});
 	current_row++;
-	n.WaitForNotification();     
+	n.WaitForNotification();
       }
     }
     
