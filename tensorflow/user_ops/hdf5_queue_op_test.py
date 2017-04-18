@@ -44,21 +44,33 @@ class DuplicateOpTest(tf.test.TestCase):
 
   def testBasic(self):
     shapes = [[1], [2, 3], [1, 1]]
+    dtypes = [numpy.int32, numpy.float32, numpy.float32]
     queue = HDF5Queue("/tmp/test.hdf5",
                       ['a', 'b/c', 'd/e/f'],
-                      [tf.int32, tf.float32, tf.float32],
-                      shapes)
+                      dtypes, shapes)
 
     with self.test_session() as sess:
       sess.run(queue.enqueue([numpy.zeros(s) for s in shapes]))
       sess.run(queue.enqueue([numpy.ones(s) for s in shapes]))
       sess.run(queue.enqueue([numpy.ones(s) for s in shapes]))
       sess.run(queue.enqueue([numpy.zeros(s) for s in shapes]))
-      self.assertEqual(sess.run(queue.dequeue()), [numpy.zeros(s) for s in shapes])
-      self.assertEqual(sess.run(queue.dequeue()), [numpy.ones(s) for s in shapes])
-      self.assertEqual(sess.run(queue.dequeue()), [numpy.ones(s) for s in shapes])
-      self.assertEqual(sess.run(queue.dequeue()), [numpy.zeros(s) for s in shapes])
-
+      
+      for a, b in zip(sess.run(queue.dequeue()), 
+                      [numpy.zeros(s, dtype=d) 
+                       for s, d in zip(shapes, dtypes)]):
+        self.assertEqual(a, b)
+      for a, b in zip(sess.run(queue.dequeue()), 
+                      [numpy.ones(s, dtype=d) 
+                       for s, d in zip(shapes, dtypes)]):
+        self.assertEqual(a, b)
+      for a, b in zip(sess.run(queue.dequeue()), 
+                      [numpy.ones(s, dtype=d) 
+                       for s, d in zip(shapes, dtypes)]):
+        self.assertEqual(a, b)
+      for a, b in zip(sess.run(queue.dequeue()), 
+                      [numpy.zeros(s, dtype=d) 
+                       for s, d in zip(shapes, dtypes)]):
+        self.assertEqual(a, b)
 
 if __name__ == '__main__':
   tf.test.main()

@@ -17,8 +17,8 @@
 
 #include <deque>
 #include <vector>
-#include <iostream>
 #include <thread>
+#include <iostream>
 
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/node_def_util.h"
@@ -54,6 +54,12 @@ namespace tensorflow {
       back_queue(new FIFOQueue(capacity, component_dtypes, component_shapes, name)),
       filename(filename_), datasets(datasets_), overwrite(overwrite) {    }
 
+    ~HDF5Queue() {
+      for (hid_t dset : dataset_ids)
+	H5Dclose(dset);
+      H5Fclose(file);
+    }
+    
     Status MatchesNodeDef(const NodeDef& node_def) override {
       if (!MatchesNodeDefOp(node_def, "HDF5Queue").ok()) {
 	return errors::InvalidArgument("Expected HDF5Queue, found ", node_def.op());
@@ -171,6 +177,7 @@ namespace tensorflow {
 	  assert(prop > 0);
 	  hid_t dspace = H5Screate_simple(s.dims()+1, dims.data(), maxdims.data());
 	  assert(dspace > 0);
+	  assert(H5Sget_simple_extent_ndims(dspace) == dims.size());
 	  
 	  dset_id = H5Dcreate2(file, datasets[i].c_str(), 
 			       get_type(component_dtypes_[i]), dspace,
@@ -194,8 +201,7 @@ namespace tensorflow {
 	   [this, ctx, &n](const QueueInterface::Tuple& tuple) {
 	       if (ctx->status().ok()) {
 		 for (int i=0;i<dataset_ids.size();i++) {
-		   PersistentTensor pt = PersistentTensor(tuple[i]);
-		   Tensor &t = *pt.AccessTensor(ctx);
+		   const Tensor &t(tuple[i]);
 		   // Resize for append
 		   hid_t dataspace = H5Dget_space(dataset_ids[i]);
 
@@ -235,28 +241,44 @@ namespace tensorflow {
       while (!done) {
 	Tuple tuple;
 	tuple.reserve(num_components());
-
+	
 	assert(num_components() == dataset_ids.size());
 	// Pull from HDF5
 	for (int i=0;i<dataset_ids.size();i++) {
 	  Tensor t;
 	  TensorShape s = component_shapes_[i];
+
 	  ctx->allocate_temp(component_dtypes_[i], s, &t);
 	  hid_t dataspace = H5Dget_space(dataset_ids[i]);
 	  std::vector<hsize_t> offset(t.dims()+1, 0), stride(t.dims()+1, 1), 
-	    count(t.shape().dim_sizes().data(), 
-		  t.shape().dim_sizes().data() + t.dims()), dims(t.dims()+1, 0);
-	  offset[0] = current_row++;
+	    count(t.dims()), dims(t.dims()+1, 0);
+	  offset[0] = current_row;
+
+	  for (int j=0;j<t.dims();j++)
+	    count[j] = t.shape().dim_size(j);
+	  hid_t memspace = H5Screate_simple(t.dims(), count.data(), NULL);
+
 	  count.insert(count.begin(), 1); // 1 row
-	  
 	  status = H5Sselect_hyperslab(dataspace, H5S_SELECT_SET, offset.data(),
 				       stride.data(), count.data(), NULL);
+
+	  std::cerr << "CNT: ";
+	  for (hsize_t x : count)
+	    std::cerr << x << " ";
+	  std::cerr << std::endl;
+
+	  std::cerr << t.NumElements() << " vs. " << H5Sget_simple_extent_npoints(dataspace) << std::endl;
+	  std::cerr << t.NumElements() << " vs. " << H5Sget_simple_extent_npoints(memspace) << std::endl;
+	  assert(t.NumElements() == H5Sget_simple_extent_npoints(dataspace));
+	  assert(t.NumElements() == H5Sget_simple_extent_npoints(memspace));
 	  H5Dread(dataset_ids[i], get_type(component_dtypes_[i]), 
-		  H5S_ALL, H5S_ALL, H5P_DEFAULT, const_cast<void*>(DMAHelper::base(&t)));
+	  	  memspace, dataspace, H5P_DEFAULT, const_cast<void*>(DMAHelper::base(&t)));
+
 	  tuple.emplace_back(t);
 	}
-
+	
 	FIFOQueue::TryEnqueue(tuple, ctx, [&n]() {n.Notify();});
+	current_row++;
 	n.WaitForNotification();
       }
     }
