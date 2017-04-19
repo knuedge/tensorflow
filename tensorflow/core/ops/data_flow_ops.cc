@@ -338,6 +338,20 @@ shared_name: If non-empty, this queue will be shared under the given name
   across multiple sessions.
 )doc");
 
+REGISTER_OP("HDF5Queue")
+    .Output("handle: resource")
+    .Attr("filename: string")
+    .Attr("datasets: list(string)")
+    .Attr("overwrite: bool = false")
+    .Attr("component_types: list(type) >= 0 = []")
+    .Attr("shapes: list(shape) >= 0 = []")
+    .Attr("shared_name: string = ''")
+    .Attr("container: string = ''")
+    .Attr("capacity: int = -1")
+    .SetIsStateful()
+    .SetShapeFn(TwoElementOutput)
+    .Doc(R"doc()");
+
 REGISTER_OP("PaddingFIFOQueue")
     .Output("handle: Ref(string)")
     .Attr("component_types: list(type) >= 1")

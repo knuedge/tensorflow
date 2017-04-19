@@ -77,7 +77,7 @@ string AppendTimestampToFilePath(const string& in, const uint64 timestamp) {
   string out = strings::StrCat(in, "_", timestamp);
 
   uint64 i = 1;
-  while (Env::Default()->FileExists(out).ok()xo) {
+  while (Env::Default()->FileExists(out).ok()) {
     out = strings::StrCat(in, "_", timestamp, "-", i);
     ++i;
   }

@@ -1434,7 +1434,6 @@ tf_cc_tests(
 
 cc_library(
     name = "fifo_queue",
-    srcs = ["fifo_queue.cc"],
     hdrs = ["fifo_queue.h"],
     visibility = ["//visibility:private"],
     deps = [

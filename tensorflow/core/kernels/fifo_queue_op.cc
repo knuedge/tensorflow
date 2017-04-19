@@ -60,4 +60,172 @@ class FIFOQueueOp : public TypedQueueOp {
 REGISTER_KERNEL_BUILDER(Name("FIFOQueue").Device(DEVICE_CPU), FIFOQueueOp);
 REGISTER_KERNEL_BUILDER(Name("FIFOQueueV2").Device(DEVICE_CPU), FIFOQueueOp);
 
+class HDF5QueueOp : public TypedQueueOp {
+ public:
+  explicit FIFOQueueOp(OpKernelConstruction* context) : TypedQueueOp(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("shapes", &component_shapes_));
+  }
+
+ private:
+  
+  // Mimic std::deque
+  class HDF5SubQueue {
+  public:
+    HDF5SubQueue(hid_t dataset) :
+      dataset(dataset) {  }
+    
+    size_t size() const {
+      return write_ind - read_ind;
+    }
+
+    PersistentTensor operator[](size_t pos) {
+      
+    }
+
+    void pop_front() {
+      ++read_ind;
+    }
+
+    push_back(const PersistentTensor &pt) {
+      
+    }
+
+    push_front() {
+      // I think FIFOQueue just uses read_ind to re-enqueue things the same data
+      --read_ind;
+    }
+    
+  private:
+    void prep_H5space(const hid_t &dset, const TensorShape &shp,
+		      hid_t &dspace, hid_t &mspace, int row_number) {
+      dspace = H5Dget_space(dset);
+      
+      std::vector<hsize_t> offset(shp.dims()+1, 0), count(shp.dims());
+
+      offset[0] = row_number;
+      for (int j=0;j<shp.dims();j++)
+	count[j] = shp.dim_size(j);
+      mspace = H5Screate_simple(shp.dims(), count.data(), NULL);
+      count.insert(count.begin(), 1); // 1 row
+
+      dspace = H5Dget_space(dset);
+      herr_t status = H5Sselect_hyperslab(dspace, H5S_SELECT_SET, offset.data(), 
+					  NULL, count.data(), NULL);
+      assert(status == 0);
+      assert(shp.num_elements() == H5Sget_select_npoints(dspace));
+      assert(shp.num_elements() == H5Sget_select_npoints(mspace));
+    }
+
+    hid_t dataset;
+    hsize_t read_ind, write_ind;
+  }
+
+  class HDF5Queue : public FIFOQueue<HDF5SubQueue> {
+  public:
+    Status MatchesNodeDef(const NodeDef& node_def) override {
+      if (!MatchesNodeDefOp(node_def, "HDF5Queue").ok()) {
+	return errors::InvalidArgument("Expected HDF5Queue, found ", node_def.op());
+      }
+      TF_RETURN_IF_ERROR(MatchesNodeDefCapacity(node_def, capacity_));
+      TF_RETURN_IF_ERROR(MatchesNodeDefTypes(node_def));
+      TF_RETURN_IF_ERROR(MatchesNodeDefShapes(node_def));
+      return Status::OK();
+    }
+    
+    Status Initialize(string filename, std::vector<string> datasets) {
+      if (component_dtypes_.empty()) {
+	return errors::InvalidArgument("Empty component types for queue ", name_);
+      }
+      if (!component_shapes_.empty() &&
+	  component_dtypes_.size() != component_shapes_.size()) {
+	return errors::InvalidArgument(
+				       "Different number of component types.  ", "Types: ",
+				       DataTypeSliceString(component_dtypes_), ", Shapes: ",
+				       ShapeListString(component_shapes_));
+      }
+
+      mutex_lock lock(mu_);
+      queues_.reserve(num_components());
+
+      if (Env::Default()->FileExists(filename).ok()) {
+	// Open file
+	file = H5Fopen(filename.c_str(), 
+		       (overwrite ? H5F_ACC_TRUNC : H5F_ACC_RDWR), 
+		       H5P_DEFAULT);
+      } else {
+	file = H5Fcreate(filename.c_str(), H5F_ACC_TRUNC, 
+			 H5P_DEFAULT, H5P_DEFAULT);
+      }
+      assert(file >= 0); // File opened properly
+
+      for (int i = 0; i < num_components(); ++i) {
+	size_t pos = datasets[i].rfind("/");
+	if (pos != string::npos) {
+	  string path = datasets[i].substr(0, pos);
+	  status = H5Eset_auto2(0, NULL, NULL);
+	  status = H5Gget_objinfo(file, path.c_str(), 0, NULL);
+	  if (status != 0) { // Path doesn't exist, create it
+	    hid_t lcpl = H5Pcreate(H5P_LINK_CREATE);
+	    H5Pset_create_intermediate_group(lcpl, 1);
+	    assert(H5Gcreate(file, path.c_str(), lcpl, H5P_DEFAULT, H5P_DEFAULT) > 0);
+	  }
+	}
+
+	hid_t dset_id;
+	if (H5Lexists(file, datasets[i].c_str(), H5P_DEFAULT) > 0) {
+	  dset_id = H5Dopen2(file, datasets[i].c_str(), H5P_DEFAULT);
+	  hid_t dspace = H5Dget_space(dset_id);
+	  assert(H5Sget_simple_extent_ndims(dspace) == component_shapes_[i].dims()+1);
+	} else {
+	  const TensorShape &s = component_shapes_[i];
+	  std::vector<hsize_t> dims(s.dims());
+	  for (int i=0;i<s.dims();i++)
+	    dims[i] = s.dim_size(i);
+	  dims.insert(dims.begin(), 1);
+	  std::vector<hsize_t> maxdims(dims), chunkdims(dims);
+	  maxdims[0] = H5S_UNLIMITED;
+	  chunkdims[0] = 5; // Design choice
+
+	  hid_t prop = H5Pcreate(H5P_DATASET_CREATE);
+	  H5Pset_chunk(prop, s.dims()+1, chunkdims.data());
+	  assert(prop > 0);
+	  hid_t dspace = H5Screate_simple(s.dims()+1, dims.data(), maxdims.data());
+	  assert(dspace > 0);
+	  assert(H5Sget_simple_extent_ndims(dspace) == dims.size());
+
+	  dset_id = H5Dcreate2(file, datasets[i].c_str(), 
+			       get_type(component_dtypes_[i]), dspace,
+			       H5P_DEFAULT, prop, H5P_DEFAULT);
+	}
+	assert(dset_id >= 0);
+	
+	queues_.push_back(HDF5SubQueue(dset_id));
+      }
+      return Status::OK();
+    }
+    
+  private:
+    hid_t file;
+  }
+
+  Status CreateResource(QueueInterface** ret) override
+      EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+    HDF5Queue* queue = new HDF5Queue(capacity_, component_types_,
+				     component_shapes_, cinfo_.name());
+    if (queue == nullptr) {
+      return errors::ResourceExhausted("Failed to allocate queue.");
+    }
+    *ret = queue;
+    return queue->Initialize(filename);
+  }
+
+  std::vector<TensorShape> component_shapes_;
+  TF_DISALLOW_COPY_AND_ASSIGN(FIFOQueueOp);
+};
+
+REGISTER_KERNEL_BUILDER(Name("FIFOQueue").Device(DEVICE_CPU), FIFOQueueOp);
+REGISTER_KERNEL_BUILDER(Name("FIFOQueueV2").Device(DEVICE_CPU), FIFOQueueOp);
+
+REGISTER_KERNEL_BUILDER(Name("HDF5Queue").Device(DEVICE_CPU), HDF5QueueOp);
+
 }  // namespace tensorflow
