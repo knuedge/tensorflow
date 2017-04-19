@@ -13,22 +13,6 @@ load("//tensorflow:tensorflow.bzl", "tf_py_test")
 load("//tensorflow:tensorflow.bzl", "tf_custom_op_library")
 
 tf_custom_op_library(
-    name = "hdf5_queue_op.so",
-    srcs = ["hdf5_queue_op.cc"],
-    deps = [
-        "//tensorflow/core/kernels:fifo_queue_op",
-    ]
-)
-
-tf_py_test(
-    name = "hdf5_queue_op_test",
-    size = "small",
-    srcs = ["hdf5_queue_op_test.py"],
-    additional_deps = ["//tensorflow:tensorflow_py"],
-    data = [":hdf5_queue_op.so"],
-)
-
-tf_custom_op_library(
     name = "ackermann_op.so",
     srcs = ["ackermann_op.cc"],
 )
