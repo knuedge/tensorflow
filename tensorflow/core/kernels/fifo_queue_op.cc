@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <deque>
 #include <vector>
+#include <hdf5.h>
+#include <assert.h>
 
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/resource_mgr.h"
@@ -35,6 +37,8 @@ limitations under the License.
 
 namespace tensorflow {
 
+typedef FIFOQueue<std::deque<PersistentTensor> > SimpleFIFOQueue;
+
 // Defines a FIFOQueueOp, which produces a Queue (specifically, one
 // backed by FIFOQueue) that persists across different graph
 // executions, and sessions. Running this op produces a single-element
@@ -48,8 +52,9 @@ class FIFOQueueOp : public TypedQueueOp {
  private:
   Status CreateResource(QueueInterface** ret) override
       EXCLUSIVE_LOCKS_REQUIRED(mu_) {
-    FIFOQueue* queue = new FIFOQueue(capacity_, component_types_,
-                                     component_shapes_, cinfo_.name());
+    SimpleFIFOQueue* queue = 
+      new SimpleFIFOQueue(capacity_, component_types_,
+			  component_shapes_, cinfo_.name());
     return CreateTypedQueue(queue, ret);
   }
 
@@ -79,18 +84,42 @@ class HDF5QueueOp : public TypedQueueOp {
     }
 
     PersistentTensor operator[](size_t pos) {
+      Tensor t;
+      TensorShape s = component_shapes_[i];
+      ctx->allocate_temp(component_dtypes_[i], s, &t);
       
+      hid_t dataspace, memspace;
+      prep_H5space(dataset_ids[i], t.shape(), dataspace, memspace, read_row);
+      std::cerr << "Reading " << read_row << std::endl;
+      H5Dread(dataset_ids[i], get_type(component_dtypes_[i]), 
+	      memspace, dataspace, H5P_DEFAULT,
+	      const_cast<void*>(DMAHelper::base(&t)));	  
+      ++read_row;
+      return t;
     }
 
     void pop_front() {
       ++read_ind;
     }
 
-    push_back(const PersistentTensor &pt) {
+    void push_back(const PersistentTensor &pt) {
+      const Tensor &t(pt);
+      hid_t dataspace, memspace;
       
+      prep_H5space(dataset, t.shape(), dataspace, memspace, write_row);
+      // Write to Hyperslab
+      H5Dwrite(dataset, get_type(t.dtype()), 
+	       memspace, dataspace, H5P_DEFAULT, 
+	       const_cast<void*>(DMAHelper::base(&t)));
+      
+      std::vector<hsize_t> dims(t.dims()+1);
+      H5Sget_simple_extent_dims(H5Dget_space(dataset), dims.data(), NULL);
+      dims[0]++;
+      H5Dset_extent(dataset, dims.data());
+      ++write_row;
     }
 
-    push_front() {
+    void push_front() {
       // I think FIFOQueue just uses read_ind to re-enqueue things the same data
       --read_ind;
     }
@@ -114,6 +143,27 @@ class HDF5QueueOp : public TypedQueueOp {
       assert(status == 0);
       assert(shp.num_elements() == H5Sget_select_npoints(dspace));
       assert(shp.num_elements() == H5Sget_select_npoints(mspace));
+    }
+
+    hid_t get_type(DataType t) {
+      switch (t) {
+      case DT_FLOAT:      return H5T_IEEE_F32LE;
+      case DT_DOUBLE:     return H5T_IEEE_F64LE;
+      case DT_INT8:       return H5T_STD_I8LE;
+      case DT_INT16:      return H5T_STD_I16LE;
+      case DT_INT32:      return H5T_STD_I32LE;
+      case DT_INT64:      return H5T_STD_I64LE;
+      case DT_UINT8:      return H5T_STD_U8LE;
+      case DT_UINT16:     return H5T_STD_U16LE;
+	//case DT_STRING:     return H5T_C_STRING; // TODO: Add String support. This doesn't build
+      case DT_BOOL:       return H5T_NATIVE_HBOOL;
+      case DT_COMPLEX64:  return H5T_IEEE_F64LE; // TODO: Fix
+      case DT_COMPLEX128: return H5T_IEEE_F64LE; // TODO: Fix
+      case DT_QINT8:      return H5T_STD_I8LE; // TODO: Figure these out
+      case DT_QINT32:     return H5T_STD_I32LE;
+      case DT_QUINT8:     return H5T_STD_U8LE;
+      }
+      return H5T_IEEE_F32LE;
     }
 
     hid_t dataset;

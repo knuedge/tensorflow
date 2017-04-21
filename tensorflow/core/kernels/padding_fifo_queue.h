@@ -32,7 +32,7 @@ limitations under the License.
 
 namespace tensorflow {
 
-class PaddingFIFOQueue : public FIFOQueue {
+class PaddingFIFOQueue : public FIFOQueue<std::deque<PersistentTensor> > {
  public:
   PaddingFIFOQueue(int32 capacity, const DataTypeVector& component_dtypes,
                    const std::vector<PartialTensorShape>& component_shapes,

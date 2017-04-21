@@ -26,6 +26,7 @@ limitations under the License.
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/kernels/typed_queue.h"
 #include "tensorflow/core/kernels/queue_base.h"
+#include "tensorflow/core/framework/queue_interface.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/macros.h"
@@ -34,9 +35,13 @@ limitations under the License.
 
 namespace tensorflow {
 
-template <class SubQueue=std::deque<PersistentTensor> >
+template <typename SubQueue>
 class FIFOQueue : public TypedQueue<SubQueue> {
  public:
+  typedef typename TypedQueue<SubQueue>::Tuple Tuple;
+  typedef typename TypedQueue<SubQueue>::DoneCallback DoneCallback;
+  typedef typename TypedQueue<SubQueue>::CallbackWithTuple CallbackWithTuple;
+
   FIFOQueue(int32 capacity, const DataTypeVector& component_dtypes,
             const std::vector<TensorShape>& component_shapes,
             const string& name);
@@ -53,10 +58,7 @@ class FIFOQueue : public TypedQueue<SubQueue> {
                       CallbackWithTuple callback) override;
   Status MatchesNodeDef(const NodeDef& node_def) override;
 
-  int32 size() override {
-    mutex_lock lock(mu_);
-    return queues_[0].size();
-  }
+  int32 size() override;
 
  protected:
   ~FIFOQueue() override {}
@@ -74,12 +76,13 @@ class FIFOQueue : public TypedQueue<SubQueue> {
   TF_DISALLOW_COPY_AND_ASSIGN(FIFOQueue);
 };
 
-template <class SubQueue=std::deque<PersistentTensor> >
+template <typename SubQueue>
 FIFOQueue<SubQueue>::FIFOQueue(int capacity, const DataTypeVector& component_dtypes,
                      const std::vector<TensorShape>& component_shapes,
                      const string& name)
-    : TypedQueue(capacity, component_dtypes, component_shapes, name) {}
+    : TypedQueue<SubQueue>(capacity, component_dtypes, component_shapes, name) {}
 
+template <typename SubQueue>
 void FIFOQueue<SubQueue>::DequeueLocked(OpKernelContext* ctx, Tuple* tuple) {
   DCHECK_GT(queues_[0].size(), size_t{0});
   (*tuple).reserve(num_components());
@@ -89,7 +92,13 @@ void FIFOQueue<SubQueue>::DequeueLocked(OpKernelContext* ctx, Tuple* tuple) {
   }
 }
 
-template <class SubQueue=std::deque<PersistentTensor> >
+template <typename SubQueue>
+int32 FIFOQueue<SubQueue>::size() {
+  mutex_lock lock(mu_);
+  return queues_[0].size();
+}
+
+template <typename SubQueue>
 void FIFOQueue<SubQueue>::TryEnqueue(const Tuple& tuple, OpKernelContext* ctx,
                            DoneCallback callback) {
   CancellationManager* cm = ctx->cancellation_manager();
@@ -127,7 +136,7 @@ void FIFOQueue<SubQueue>::TryEnqueue(const Tuple& tuple, OpKernelContext* ctx,
   }
 }
 
-template <class SubQueue=std::deque<PersistentTensor> >
+template <typename SubQueue>
 /* static */
 Status FIFOQueue<SubQueue>::GetElementComponentFromBatch(const FIFOQueue<SubQueue>::Tuple& tuple,
                                                int64 index, int component,
@@ -143,7 +152,7 @@ Status FIFOQueue<SubQueue>::GetElementComponentFromBatch(const FIFOQueue<SubQueu
   return Status::OK();
 }
 
-template <class SubQueue=std::deque<PersistentTensor> >
+template <typename SubQueue>
 void FIFOQueue<SubQueue>::TryEnqueueMany(const Tuple& tuple, OpKernelContext* ctx,
                                DoneCallback callback) {
   const int64 batch_size = tuple[0].dim_size(0);
@@ -197,7 +206,7 @@ void FIFOQueue<SubQueue>::TryEnqueueMany(const Tuple& tuple, OpKernelContext* ct
   }
 }
 
-template <class SubQueue=std::deque<PersistentTensor> >
+template <typename SubQueue>
 void FIFOQueue<SubQueue>::TryDequeue(OpKernelContext* ctx, CallbackWithTuple callback) {
   CancellationManager* cm = ctx->cancellation_manager();
   CancellationToken token = cm->get_cancellation_token();
@@ -238,7 +247,7 @@ void FIFOQueue<SubQueue>::TryDequeue(OpKernelContext* ctx, CallbackWithTuple cal
   }
 }
 
-template <class SubQueue=std::deque<PersistentTensor> >
+template <typename SubQueue>
 void FIFOQueue<SubQueue>::TryDequeueMany(int num_elements, OpKernelContext* ctx,
                                bool allow_small_batch,
                                CallbackWithTuple callback) {
@@ -403,7 +412,7 @@ void FIFOQueue<SubQueue>::TryDequeueMany(int num_elements, OpKernelContext* ctx,
   }
 }
 
-template <class SubQueue=std::deque<PersistentTensor> >
+template <typename SubQueue>
 Status FIFOQueue<SubQueue>::MatchesNodeDef(const NodeDef& node_def) {
   if (!MatchesNodeDefOp(node_def, "FIFOQueue").ok() &&
       !MatchesNodeDefOp(node_def, "FIFOQueueV2").ok()) {
