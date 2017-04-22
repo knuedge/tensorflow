@@ -41,6 +41,8 @@ class FIFOQueue : public TypedQueue<SubQueue> {
   typedef typename TypedQueue<SubQueue>::Tuple Tuple;
   typedef typename TypedQueue<SubQueue>::DoneCallback DoneCallback;
   typedef typename TypedQueue<SubQueue>::CallbackWithTuple CallbackWithTuple;
+  typedef typename TypedQueue<SubQueue>::Attempt Attempt;
+  typedef typename TypedQueue<SubQueue>::RunResult RunResult;
 
   FIFOQueue(int32 capacity, const DataTypeVector& component_dtypes,
             const std::vector<TensorShape>& component_shapes,
@@ -84,18 +86,18 @@ FIFOQueue<SubQueue>::FIFOQueue(int capacity, const DataTypeVector& component_dty
 
 template <typename SubQueue>
 void FIFOQueue<SubQueue>::DequeueLocked(OpKernelContext* ctx, Tuple* tuple) {
-  DCHECK_GT(queues_[0].size(), size_t{0});
-  (*tuple).reserve(num_components());
-  for (int i = 0; i < num_components(); ++i) {
-    (*tuple).push_back(*queues_[i][0].AccessTensor(ctx));
-    queues_[i].pop_front();
+  DCHECK_GT(this->queues_[0].size(), size_t{0});
+  (*tuple).reserve(this->num_components());
+  for (int i = 0; i < this->num_components(); ++i) {
+    (*tuple).push_back(*this->queues_[i][0].AccessTensor(ctx));
+    this->queues_[i].pop_front();
   }
 }
 
 template <typename SubQueue>
 int32 FIFOQueue<SubQueue>::size() {
-  mutex_lock lock(mu_);
-  return queues_[0].size();
+  mutex_lock lock(this->mu_);
+  return this->queues_[0].size();
 }
 
 template <typename SubQueue>
@@ -105,31 +107,31 @@ void FIFOQueue<SubQueue>::TryEnqueue(const Tuple& tuple, OpKernelContext* ctx,
   CancellationToken token = cm->get_cancellation_token();
   bool already_cancelled;
   {
-    mutex_lock l(mu_);
+    mutex_lock l(this->mu_);
     already_cancelled = !cm->RegisterCallback(
-        token, [this, cm, token]() { Cancel(kEnqueue, cm, token); });
+        token, [this, cm, token]() { this->Cancel(this->kEnqueue, cm, token); });
     if (!already_cancelled) {
-      enqueue_attempts_.emplace_back(
+      this->enqueue_attempts_.emplace_back(
           1, callback, ctx, cm, token,
           [tuple, this](Attempt* attempt) EXCLUSIVE_LOCKS_REQUIRED(mu_) {
-            if (closed_) {
+            if (this->closed_) {
               attempt->context->SetStatus(
-                  errors::Cancelled("FIFOQueue '", name_, "' is closed."));
-              return kComplete;
+                  errors::Cancelled("FIFOQueue '", this->name_, "' is closed."));
+              return this->kComplete;
             }
-            if (queues_[0].size() < static_cast<size_t>(capacity_)) {
-              for (int i = 0; i < num_components(); ++i) {
-                queues_[i].push_back(PersistentTensor(tuple[i]));
+            if (this->queues_[0].size() < static_cast<size_t>(this->capacity_)) {
+              for (int i = 0; i < this->num_components(); ++i) {
+                this->queues_[i].push_back(PersistentTensor(tuple[i]));
               }
-              return kComplete;
+              return this->kComplete;
             } else {
-              return kNoProgress;
+              return this->kNoProgress;
             }
           });
     }
   }
   if (!already_cancelled) {
-    FlushUnlocked();
+    this->FlushUnlocked();
   } else {
     ctx->SetStatus(errors::Cancelled("Enqueue operation was cancelled"));
     callback();
@@ -148,7 +150,7 @@ Status FIFOQueue<SubQueue>::GetElementComponentFromBatch(const FIFOQueue<SubQueu
   TF_RETURN_IF_ERROR(ctx->allocate_persistent(
       tuple[component].dtype(), element_shape, out_tensor, &element_access));
   TF_RETURN_IF_ERROR(
-      CopySliceToElement(tuple[component], element_access, index));
+  FIFOQueue<SubQueue>::CopySliceToElement(tuple[component], element_access, index));
   return Status::OK();
 }
 
@@ -165,33 +167,33 @@ void FIFOQueue<SubQueue>::TryEnqueueMany(const Tuple& tuple, OpKernelContext* ct
   CancellationToken token = cm->get_cancellation_token();
   bool already_cancelled;
   {
-    mutex_lock l(mu_);
+    mutex_lock l(this->mu_);
     already_cancelled = !cm->RegisterCallback(
-        token, [this, cm, token]() { Cancel(kEnqueue, cm, token); });
+        token, [this, cm, token]() { this->Cancel(this->kEnqueue, cm, token); });
     if (!already_cancelled) {
-      enqueue_attempts_.emplace_back(
+      this->enqueue_attempts_.emplace_back(
           batch_size, callback, ctx, cm, token,
           [tuple, this](Attempt* attempt) EXCLUSIVE_LOCKS_REQUIRED(mu_) {
-            if (closed_) {
+            if (this->closed_) {
               attempt->context->SetStatus(
-                  errors::Cancelled("FIFOQueue '", name_, "' is closed."));
-              return kComplete;
+                  errors::Cancelled("FIFOQueue '", this->name_, "' is closed."));
+              return this->kComplete;
             }
-            RunResult result = kNoProgress;
-            while (queues_[0].size() < static_cast<size_t>(capacity_)) {
-              result = kProgress;
+            RunResult result = this->kNoProgress;
+            while (this->queues_[0].size() < static_cast<size_t>(this->capacity_)) {
+              result = this->kProgress;
               const int64 index =
                   tuple[0].dim_size(0) - attempt->elements_requested;
-              for (int i = 0; i < num_components(); ++i) {
+              for (int i = 0; i < this->num_components(); ++i) {
                 PersistentTensor element;
                 attempt->context->SetStatus(GetElementComponentFromBatch(
                     tuple, index, i, attempt->context, &element));
-                if (!attempt->context->status().ok()) return kComplete;
-                queues_[i].push_back(element);
+                if (!attempt->context->status().ok()) return this->kComplete;
+                this->queues_[i].push_back(element);
               }
               --attempt->elements_requested;
               if (attempt->elements_requested == 0) {
-                return kComplete;
+                return this->kComplete;
               }
             }
             return result;
@@ -199,7 +201,7 @@ void FIFOQueue<SubQueue>::TryEnqueueMany(const Tuple& tuple, OpKernelContext* ct
     }
   }
   if (!already_cancelled) {
-    FlushUnlocked();
+    this->FlushUnlocked();
   } else {
     ctx->SetStatus(errors::Cancelled("Enqueue operation was cancelled"));
     callback();
@@ -212,35 +214,35 @@ void FIFOQueue<SubQueue>::TryDequeue(OpKernelContext* ctx, CallbackWithTuple cal
   CancellationToken token = cm->get_cancellation_token();
   bool already_cancelled;
   {
-    mutex_lock l(mu_);
+    mutex_lock l(this->mu_);
     already_cancelled = !cm->RegisterCallback(
-        token, [this, cm, token]() { Cancel(kDequeue, cm, token); });
+        token, [this, cm, token]() { this->Cancel(this->kDequeue, cm, token); });
     if (!already_cancelled) {
       // TODO(josh11b): This makes two copies of callback, avoid this if possible.
-      dequeue_attempts_.emplace_back(
+      this->dequeue_attempts_.emplace_back(
           1, [callback]() { callback(Tuple()); }, ctx, cm, token,
           [callback, this](Attempt* attempt) EXCLUSIVE_LOCKS_REQUIRED(mu_) {
-            const int64 queue_size = queues_[0].size();
-            if (closed_ && queue_size == 0) {
+            const int64 queue_size = this->queues_[0].size();
+            if (this->closed_ && queue_size == 0) {
               attempt->context->SetStatus(errors::OutOfRange(
-                  "FIFOQueue '", name_, "' is closed and has ",
+                  "FIFOQueue '", this->name_, "' is closed and has ",
                   "insufficient elements (requested ", 1, ", current size ",
                   queue_size, ")"));
-              return kComplete;
+              return this->kComplete;
             }
             if (queue_size > 0) {
               Tuple tuple;
               DequeueLocked(attempt->context, &tuple);
               attempt->done_callback = [callback, tuple]() { callback(tuple); };
-              return kComplete;
+              return this->kComplete;
             } else {
-              return kNoProgress;
+              return this->kNoProgress;
             }
           });
     }
   }
   if (!already_cancelled) {
-    FlushUnlocked();
+    this->FlushUnlocked();
   } else {
     ctx->SetStatus(errors::Cancelled("Dequeue operation was cancelled"));
     callback(Tuple());
@@ -251,7 +253,7 @@ template <typename SubQueue>
 void FIFOQueue<SubQueue>::TryDequeueMany(int num_elements, OpKernelContext* ctx,
                                bool allow_small_batch,
                                CallbackWithTuple callback) {
-  if (!specified_shapes()) {
+  if (!this->specified_shapes()) {
     ctx->SetStatus(errors::InvalidArgument(
         "FIFOQueue's DequeueMany and DequeueUpTo require the "
         "components to have specified shapes."));
@@ -260,8 +262,8 @@ void FIFOQueue<SubQueue>::TryDequeueMany(int num_elements, OpKernelContext* ctx,
   }
   if (num_elements == 0) {
     Tuple tuple;
-    tuple.reserve(num_components());
-    for (int i = 0; i < num_components(); ++i) {
+    tuple.reserve(this->num_components());
+    for (int i = 0; i < this->num_components(); ++i) {
       // TODO(josh11b,misard): Switch to allocate_output().  Problem is
       // this breaks the abstraction boundary since we don't *really*
       // know if and how the Tensors in the tuple we pass to callback
@@ -287,8 +289,8 @@ void FIFOQueue<SubQueue>::TryDequeueMany(int num_elements, OpKernelContext* ctx,
       // an optimized case where the queue 'knows' what attributes to
       // use, and plumbs them through here.
       Tensor element;
-      Status status = ctx->allocate_temp(component_dtypes_[i],
-                                         ManyOutShape(i, 0), &element);
+      Status status = ctx->allocate_temp(this->component_dtypes_[i],
+                                         this->ManyOutShape(i, 0), &element);
       if (!status.ok()) {
         ctx->SetStatus(status);
         callback(Tuple());
@@ -304,18 +306,18 @@ void FIFOQueue<SubQueue>::TryDequeueMany(int num_elements, OpKernelContext* ctx,
   CancellationToken token = cm->get_cancellation_token();
   bool already_cancelled;
   {
-    mutex_lock l(mu_);
+    mutex_lock l(this->mu_);
     already_cancelled = !cm->RegisterCallback(
-        token, [this, cm, token]() { Cancel(kDequeue, cm, token); });
+        token, [this, cm, token]() { this->Cancel(this->kDequeue, cm, token); });
     if (!already_cancelled) {
       // TODO(josh11b): This makes two copies of callback, avoid this if possible.
-      dequeue_attempts_.emplace_back(
+      this->dequeue_attempts_.emplace_back(
           num_elements, [callback]() { callback(Tuple()); }, ctx, cm, token,
           [callback, allow_small_batch, this](Attempt* attempt)
               EXCLUSIVE_LOCKS_REQUIRED(mu_) {
-                int64 queue_size = queues_[0].size();
+                int64 queue_size = this->queues_[0].size();
 
-                if (closed_ && queue_size < attempt->elements_requested) {
+                if (this->closed_ && queue_size < attempt->elements_requested) {
                   // If we don't have enough for a full dequeue, we have
                   // to reset the attempt tuple.
                   if (!attempt->tuple.empty()) {
@@ -324,7 +326,7 @@ void FIFOQueue<SubQueue>::TryDequeueMany(int num_elements, OpKernelContext* ctx,
                     for (int64 i = attempt->tuple[0].dim_size(0) -
                                    attempt->elements_requested - 1;
                          i >= 0; --i) {
-                      for (int j = 0; j < num_components(); ++j) {
+                      for (int j = 0; j < this->num_components(); ++j) {
                         PersistentTensor element;
                         Status s = GetElementComponentFromBatch(
                             attempt->tuple, i, j, attempt->context, &element);
@@ -335,13 +337,13 @@ void FIFOQueue<SubQueue>::TryDequeueMany(int num_elements, OpKernelContext* ctx,
                                                "to FIFOQueue: ",
                                                s.error_message()));
                         }
-                        queues_[j].push_front(element);
+                        this->queues_[j].push_front(element);
                       }
                     }
                   }
-                  if (allow_small_batch && queues_[0].size() > 0) {
+                  if (allow_small_batch && this->queues_[0].size() > 0) {
                     // Request all remaining elements in the queue.
-                    queue_size = queues_[0].size();
+                    queue_size = this->queues_[0].size();
                     attempt->tuple.clear();
                     attempt->elements_requested = queue_size;
                   } else {
@@ -349,46 +351,46 @@ void FIFOQueue<SubQueue>::TryDequeueMany(int num_elements, OpKernelContext* ctx,
                       // There may be some other attempts containing
                       // values.  If so, we'll yield and wait for them
                       // to add elements to the queue.
-                      if (!enqueue_attempts_.empty()) return kProgress;
+                      if (!this->enqueue_attempts_.empty()) return this->kProgress;
                     }
                     if (attempt->context->status().ok()) {
                       attempt->context->SetStatus(errors::OutOfRange(
-                          "FIFOQueue '", name_, "' is closed and has ",
+                          "FIFOQueue '", this->name_, "' is closed and has ",
                           "insufficient elements (requested ",
                           attempt->elements_requested, ", current size ",
                           queue_size, ")"));
                     }
-                    return kComplete;
+                    return this->kComplete;
                   }
                 }
 
-                RunResult result = kNoProgress;
+                RunResult result = this->kNoProgress;
                 for (; queue_size > 0; --queue_size) {
                   if (attempt->tuple.empty()) {
                     // Only allocate tuple when we have something to dequeue
                     // so we don't use excessive memory when there are many
                     // blocked dequeue attempts waiting.
-                    attempt->tuple.reserve(num_components());
-                    for (int i = 0; i < num_components(); ++i) {
+                    attempt->tuple.reserve(this->num_components());
+                    for (int i = 0; i < this->num_components(); ++i) {
                       const TensorShape shape =
-                          ManyOutShape(i, attempt->elements_requested);
+                          this->ManyOutShape(i, attempt->elements_requested);
                       Tensor element;
                       attempt->context->SetStatus(
-                          attempt->context->allocate_temp(component_dtypes_[i],
+                          attempt->context->allocate_temp(this->component_dtypes_[i],
                                                           shape, &element));
-                      if (!attempt->context->status().ok()) return kComplete;
+                      if (!attempt->context->status().ok()) return this->kComplete;
                       attempt->tuple.emplace_back(element);
                     }
                   }
-                  result = kProgress;
+                  result = this->kProgress;
                   Tuple tuple;
                   DequeueLocked(attempt->context, &tuple);
                   const int64 index = attempt->tuple[0].dim_size(0) -
                                       attempt->elements_requested;
-                  for (int i = 0; i < num_components(); ++i) {
-                    attempt->context->SetStatus(CopyElementToSlice(
+                  for (int i = 0; i < this->num_components(); ++i) {
+                    attempt->context->SetStatus(this->CopyElementToSlice(
                         tuple[i], &attempt->tuple[i], index));
-                    if (!attempt->context->status().ok()) return kComplete;
+                    if (!attempt->context->status().ok()) return this->kComplete;
                   }
                   tuple.clear();
                   --attempt->elements_requested;
@@ -397,7 +399,7 @@ void FIFOQueue<SubQueue>::TryDequeueMany(int num_elements, OpKernelContext* ctx,
                     attempt->done_callback = [callback, tuple]() {
                       callback(tuple);
                     };
-                    return kComplete;
+                    return this->kComplete;
                   }
                 }
                 return result;
@@ -405,7 +407,7 @@ void FIFOQueue<SubQueue>::TryDequeueMany(int num_elements, OpKernelContext* ctx,
     }
   }
   if (!already_cancelled) {
-    FlushUnlocked();
+    this->FlushUnlocked();
   } else {
     ctx->SetStatus(errors::Cancelled("Dequeue operation was cancelled"));
     callback(Tuple());
@@ -414,13 +416,13 @@ void FIFOQueue<SubQueue>::TryDequeueMany(int num_elements, OpKernelContext* ctx,
 
 template <typename SubQueue>
 Status FIFOQueue<SubQueue>::MatchesNodeDef(const NodeDef& node_def) {
-  if (!MatchesNodeDefOp(node_def, "FIFOQueue").ok() &&
-      !MatchesNodeDefOp(node_def, "FIFOQueueV2").ok()) {
+  if (!this->MatchesNodeDefOp(node_def, "FIFOQueue").ok() &&
+      !this->MatchesNodeDefOp(node_def, "FIFOQueueV2").ok()) {
     return errors::InvalidArgument("Expected FIFOQueue, found ", node_def.op());
   }
-  TF_RETURN_IF_ERROR(MatchesNodeDefCapacity(node_def, capacity_));
-  TF_RETURN_IF_ERROR(MatchesNodeDefTypes(node_def));
-  TF_RETURN_IF_ERROR(MatchesNodeDefShapes(node_def));
+  TF_RETURN_IF_ERROR(this->MatchesNodeDefCapacity(node_def, this->capacity_));
+  TF_RETURN_IF_ERROR(this->MatchesNodeDefTypes(node_def));
+  TF_RETURN_IF_ERROR(this->MatchesNodeDefShapes(node_def));
   return Status::OK();
 }
 

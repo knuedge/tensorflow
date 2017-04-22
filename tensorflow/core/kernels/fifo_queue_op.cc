@@ -67,7 +67,7 @@ REGISTER_KERNEL_BUILDER(Name("FIFOQueueV2").Device(DEVICE_CPU), FIFOQueueOp);
 
 class HDF5QueueOp : public TypedQueueOp {
  public:
-  explicit FIFOQueueOp(OpKernelConstruction* context) : TypedQueueOp(context) {
+  explicit HDF5QueueOp(OpKernelConstruction* context) : TypedQueueOp(context) {
     OP_REQUIRES_OK(context, context->GetAttr("shapes", &component_shapes_));
   }
 
