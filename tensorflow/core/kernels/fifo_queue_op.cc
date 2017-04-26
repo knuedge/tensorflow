@@ -34,6 +34,7 @@ limitations under the License.
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/thread_annotations.h"
 #include "tensorflow/core/platform/types.h"
+#include "tensorflow/core/common_runtime/dma_helper.h"
 
 namespace tensorflow {
 
@@ -68,7 +69,9 @@ REGISTER_KERNEL_BUILDER(Name("FIFOQueueV2").Device(DEVICE_CPU), FIFOQueueOp);
 class HDF5QueueOp : public TypedQueueOp {
  public:
   explicit HDF5QueueOp(OpKernelConstruction* context) : TypedQueueOp(context) {
-    OP_REQUIRES_OK(context, context->GetAttr("shapes", &component_shapes_));
+    context->GetAttr("filename", &filename);
+    context->GetAttr("datasets", &datasets);
+    context->GetAttr("overwrite", &overwrite);
   }
 
  private:
@@ -76,26 +79,24 @@ class HDF5QueueOp : public TypedQueueOp {
   // Mimic std::deque
   class HDF5SubQueue {
   public:
-    HDF5SubQueue(hid_t dataset) :
-      dataset(dataset) {  }
+    HDF5SubQueue(hid_t dataset, TensorShape s, DataType dt) :
+      dataset(dataset), s(s), dt(dt) {  }
     
     size_t size() const {
       return write_ind - read_ind;
     }
 
     PersistentTensor operator[](size_t pos) {
-      Tensor t;
-      TensorShape s = component_shapes_[i];
-      ctx->allocate_temp(component_dtypes_[i], s, &t);
+      PersistentTensor pt;
+      //ctx->allocate_temp(dt, s, &t);
+      const Tensor t(pt);
       
       hid_t dataspace, memspace;
-      prep_H5space(dataset_ids[i], t.shape(), dataspace, memspace, read_row);
-      std::cerr << "Reading " << read_row << std::endl;
-      H5Dread(dataset_ids[i], get_type(component_dtypes_[i]), 
+      prep_H5space(dataset, t.shape(), dataspace, memspace, pos);
+      H5Dread(dataset, get_type(dt), 
 	      memspace, dataspace, H5P_DEFAULT,
 	      const_cast<void*>(DMAHelper::base(&t)));	  
-      ++read_row;
-      return t;
+      return pt;
     }
 
     void pop_front() {
@@ -103,10 +104,10 @@ class HDF5QueueOp : public TypedQueueOp {
     }
 
     void push_back(const PersistentTensor &pt) {
-      const Tensor &t(pt);
+      const Tensor t(pt);
       hid_t dataspace, memspace;
       
-      prep_H5space(dataset, t.shape(), dataspace, memspace, write_row);
+      prep_H5space(dataset, t.shape(), dataspace, memspace, write_ind);
       // Write to Hyperslab
       H5Dwrite(dataset, get_type(t.dtype()), 
 	       memspace, dataspace, H5P_DEFAULT, 
@@ -116,15 +117,14 @@ class HDF5QueueOp : public TypedQueueOp {
       H5Sget_simple_extent_dims(H5Dget_space(dataset), dims.data(), NULL);
       dims[0]++;
       H5Dset_extent(dataset, dims.data());
-      ++write_row;
+      ++write_ind;
     }
 
-    void push_front() {
+    void push_front(const PersistentTensor &pt) {
       // I think FIFOQueue just uses read_ind to re-enqueue things the same data
       --read_ind;
     }
     
-  private:
     void prep_H5space(const hid_t &dset, const TensorShape &shp,
 		      hid_t &dspace, hid_t &mspace, int row_number) {
       dspace = H5Dget_space(dset);
@@ -145,6 +145,7 @@ class HDF5QueueOp : public TypedQueueOp {
       assert(shp.num_elements() == H5Sget_select_npoints(mspace));
     }
 
+    static
     hid_t get_type(DataType t) {
       switch (t) {
       case DT_FLOAT:      return H5T_IEEE_F32LE;
@@ -168,10 +169,18 @@ class HDF5QueueOp : public TypedQueueOp {
 
     hid_t dataset;
     hsize_t read_ind, write_ind;
-  }
+    TensorShape s;
+    DataType dt;
+  };
 
   class HDF5Queue : public FIFOQueue<HDF5SubQueue> {
   public:
+    HDF5Queue(int32 capacity, const DataTypeVector& component_dtypes,
+	      const std::vector<TensorShape>& component_shapes,
+	      const string& name) :
+      FIFOQueue<HDF5SubQueue>(capacity, component_dtypes, component_shapes, name) { }
+
+
     Status MatchesNodeDef(const NodeDef& node_def) override {
       if (!MatchesNodeDefOp(node_def, "HDF5Queue").ok()) {
 	return errors::InvalidArgument("Expected HDF5Queue, found ", node_def.op());
@@ -182,7 +191,7 @@ class HDF5QueueOp : public TypedQueueOp {
       return Status::OK();
     }
     
-    Status Initialize(string filename, std::vector<string> datasets) {
+    Status Initialize(string filename, std::vector<string> datasets, bool overwrite) {
       if (component_dtypes_.empty()) {
 	return errors::InvalidArgument("Empty component types for queue ", name_);
       }
@@ -244,19 +253,20 @@ class HDF5QueueOp : public TypedQueueOp {
 	  assert(H5Sget_simple_extent_ndims(dspace) == dims.size());
 
 	  dset_id = H5Dcreate2(file, datasets[i].c_str(), 
-			       get_type(component_dtypes_[i]), dspace,
+			       HDF5SubQueue::get_type(component_dtypes_[i]), dspace,
 			       H5P_DEFAULT, prop, H5P_DEFAULT);
 	}
 	assert(dset_id >= 0);
 	
-	queues_.push_back(HDF5SubQueue(dset_id));
+	queues_.push_back(HDF5SubQueue(dset_id, this->component_shapes_[i], 
+				       this->component_dtypes_[i]));
       }
       return Status::OK();
     }
     
   private:
     hid_t file;
-  }
+  };
 
   Status CreateResource(QueueInterface** ret) override
       EXCLUSIVE_LOCKS_REQUIRED(mu_) {
@@ -266,15 +276,30 @@ class HDF5QueueOp : public TypedQueueOp {
       return errors::ResourceExhausted("Failed to allocate queue.");
     }
     *ret = queue;
-    return queue->Initialize(filename);
+    return queue->Initialize(filename, datasets, overwrite);
   }
 
+  string filename;
+  std::vector<string> datasets;
+  bool overwrite;
   std::vector<TensorShape> component_shapes_;
-  TF_DISALLOW_COPY_AND_ASSIGN(FIFOQueueOp);
+
+  TF_DISALLOW_COPY_AND_ASSIGN(HDF5QueueOp);
 };
 
-REGISTER_KERNEL_BUILDER(Name("FIFOQueue").Device(DEVICE_CPU), FIFOQueueOp);
-REGISTER_KERNEL_BUILDER(Name("FIFOQueueV2").Device(DEVICE_CPU), FIFOQueueOp);
+REGISTER_OP("HDF5Queue")
+  .Output("handle: resource")
+  .Attr("filename: string")
+  .Attr("datasets: list(string)")
+  .Attr("overwrite: bool = false")
+  .Attr("component_types: list(type) >= 0 = []")
+  .Attr("shapes: list(shape) >= 0 = []")
+  .Attr("shared_name: string = ''")
+  .Attr("container: string = ''")
+  .Attr("capacity: int = -1")
+  .SetIsStateful()
+  .SetShapeFn(TwoElementOutput);
+
 
 REGISTER_KERNEL_BUILDER(Name("HDF5Queue").Device(DEVICE_CPU), HDF5QueueOp);
 
